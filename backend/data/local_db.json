@@ -1,0 +1,71 @@
+{
+  "tracked_products": [
+    {
+      "id": "696b50a2-6c3a-4e2e-9541-c19d6d90640b",
+      "external_product_id": 401,
+      "name": "Vista Headphones Plus",
+      "slug": "vista-headphones-plus",
+      "brand": "Vista",
+      "category": "Audio",
+      "sku": "VIS-10401",
+      "url": "https://demo.inelabteamdev.com/product/401",
+      "image_url": "",
+      "current_price": 21642,
+      "current_stock": 153,
+      "stock_status": "SELLING FAST — 153 LEFT",
+      "last_scraped_at": "2026-09-19T19:26:12.616Z",
+      "last_scrape_status": "retried",
+      "created_at": "2026-09-19T19:21:32.121Z",
+      "updated_at": "2026-09-19T19:26:12.629Z"
+    }
+  ],
+  "price_history": [
+    {
+      "id": "aff1b74c-cfa1-4a77-bea2-4497af3f662e",
+      "tracked_product_id": "696b50a2-6c3a-4e2e-9541-c19d6d90640b",
+      "price": 21642,
+      "stock": 20,
+      "stock_status": "IN STOCK · 20 LEFT",
+      "scraped_at": "2026-09-19T19:21:39.510Z"
+    },
+    {
+      "id": "54f1b87e-63af-4acb-baae-5c27da8ec84f",
+      "tracked_product_id": "696b50a2-6c3a-4e2e-9541-c19d6d90640b",
+      "price": 21642,
+      "stock": 153,
+      "stock_status": "SELLING FAST — 153 LEFT",
+      "scraped_at": "2026-09-19T19:26:12.616Z"
+    }
+  ],
+  "scrape_logs": [
+    {
+      "id": "50b4ce21-3448-429e-9239-e25affe89ec1",
+      "tracked_product_id": "696b50a2-6c3a-4e2e-9541-c19d6d90640b",
+      "attempted_at": "2026-09-19T19:21:39.529Z",
+      "status": "success",
+      "attempts": 1,
+      "duration_ms": 7402,
+      "http_status": 200,
+      "error_message": null,
+      "details": {
+        "formattedPrice": "₹21,642",
+        "seller": "Marlowe & Co"
+      }
+    },
+    {
+      "id": "e7211635-6799-4a5b-a37e-550675247efd",
+      "tracked_product_id": "696b50a2-6c3a-4e2e-9541-c19d6d90640b",
+      "attempted_at": "2026-09-19T19:26:12.634Z",
+      "status": "retried",
+      "attempts": 2,
+      "duration_ms": 58487,
+      "http_status": 200,
+      "error_message": null,
+      "details": {
+        "formattedPrice": "₹21,642",
+        "seller": "Quillon Direct",
+        "intercepted": true
+      }
+    }
+  ]
+}

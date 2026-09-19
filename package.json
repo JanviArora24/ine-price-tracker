@@ -1,0 +1,21 @@
+{
+  "name": "ine-price-tracker-root",
+  "version": "1.0.0",
+  "description": "Full-Stack Product Price Tracker for INE Mock Store",
+  "scripts": {
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "scrape:headed": "npm --prefix backend run scrape:headed",
+    "test": "npm --prefix backend test"
+  },
+  "keywords": [
+    "price-tracker",
+    "scraper",
+    "playwright",
+    "supabase",
+    "react",
+    "express"
+  ],
+  "author": "",
+  "license": "MIT"
+}
