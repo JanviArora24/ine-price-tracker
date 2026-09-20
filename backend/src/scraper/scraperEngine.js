@@ -3,32 +3,30 @@ const { decryptPayload } = require('./decryptor');
 const { validateScrapedData } = require('./validator');
 const config = require('../config/env');
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Prevent a scrape attempt from hanging indefinitely.
- */
-function withTimeout(
-  promise,
-  ms,
-  message = 'Scrape attempt timed out'
-) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(message)), ms)
-    )
-  ]);
+function withTimeout(promise, ms, message = 'Scrape attempt timed out') {
+  let timer;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(message));
+    }, ms);
+  });
+
+  return Promise.race([promise, timeoutPromise])
+    .finally(() => clearTimeout(timer));
 }
 
 /**
- * Executes a single scrape attempt for a product on the INE mock store
+ * Execute one scrape attempt.
  */
 async function scrapeAttempt(productId, isHeaded = false) {
   const baseUrl = config.mockStoreBaseUrl;
   const targetUrl = `${baseUrl}/product/${productId}`;
 
-  // Security check: only scrape the designated mock store
+  // Security check
   const urlObj = new URL(targetUrl);
 
   if (
@@ -40,105 +38,185 @@ async function scrapeAttempt(productId, isHeaded = false) {
     );
   }
 
-  const browser = await getBrowser(isHeaded);
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-  });
-
-  const page = await context.newPage();
-
-  // General Playwright timeout
-  page.setDefaultTimeout(config.scrapeTimeoutMs);
-
-  // Prevent navigation from hanging indefinitely
-  page.setDefaultNavigationTimeout(20000);
-
-  let capturedToken = null;
-  let decryptedQuote = null;
-  let lastHttpStatus = 200;
-
-  // Intercept network responses to capture server token & decrypted price payload
-  page.on('response', async res => {
-    const url = res.url();
-
-    if (url.includes('/api/session') && res.status() === 200) {
-      try {
-        const data = await res.json();
-
-        if (data && data.token) {
-          capturedToken = data.token;
-        }
-      } catch (e) { }
-    }
-
-    if (url.includes(`/api/products/${productId}/price`)) {
-      lastHttpStatus = res.status();
-
-      if (res.status() === 200) {
-        try {
-          const data = await res.json();
-
-          if (data && data.e && capturedToken) {
-            decryptedQuote = decryptPayload(data.e, capturedToken);
-          }
-        } catch (e) { }
-      }
-    }
-  });
+  let browser = null;
+  let context = null;
 
   try {
-    // 1. Navigate to product page
-    await page.goto(targetUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 20000
+    console.log(`[Scraper] Launching browser for product ${productId}...`);
+
+    // Protect browser launch itself
+    browser = await withTimeout(
+      getBrowser(isHeaded),
+      15000,
+      `Browser launch timed out for product ${productId}`
+    );
+
+    console.log(`[Scraper] Browser ready for product ${productId}`);
+
+    context = await withTimeout(
+      browser.newContext({
+        viewport: {
+          width: 1280,
+          height: 800
+        },
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      }),
+      10000,
+      `Browser context creation timed out for product ${productId}`
+    );
+
+    const page = await withTimeout(
+      context.newPage(),
+      10000,
+      `Page creation timed out for product ${productId}`
+    );
+
+    page.setDefaultTimeout(
+      Math.min(config.scrapeTimeoutMs || 10000, 10000)
+    );
+
+    page.setDefaultNavigationTimeout(15000);
+
+    let capturedToken = null;
+    let decryptedQuote = null;
+    let lastHttpStatus = 200;
+
+    // Capture API responses
+    page.on('response', async (res) => {
+      try {
+        const url = res.url();
+
+        // Session token
+        if (
+          url.includes('/api/session') &&
+          res.status() === 200
+        ) {
+          const data = await res.json().catch(() => null);
+
+          if (data && data.token) {
+            capturedToken = data.token;
+            console.log(
+              `[Scraper] Captured session token for product ${productId}`
+            );
+          }
+        }
+
+        // Price API
+        if (
+          url.includes(`/api/products/${productId}/price`)
+        ) {
+          lastHttpStatus = res.status();
+
+          if (res.status() === 200) {
+            const data = await res.json().catch(() => null);
+
+            if (data && data.e && capturedToken) {
+              try {
+                decryptedQuote = decryptPayload(
+                  data.e,
+                  capturedToken
+                );
+              } catch (err) {
+                console.warn(
+                  `[Scraper] Could not decrypt price payload: ${err.message}`
+                );
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Never allow response listener errors to break scraping
+      }
     });
 
-    // Helper: Proactively dismiss or clear the delayed cookie banner overlay
+    // -------------------------------------------------------
+    // 1. Navigate
+    // -------------------------------------------------------
+
+    console.log(
+      `[Scraper] Navigating to ${targetUrl}...`
+    );
+
+    await page.goto(targetUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 15000
+    });
+
+    console.log(
+      `[Scraper] Product page loaded for ${productId}`
+    );
+
+    // -------------------------------------------------------
+    // Cookie overlay handler
+    // -------------------------------------------------------
+
     async function handleCookieOverlay() {
       try {
         const overlay = page.locator('.cookie-overlay');
 
-        if (await overlay.isVisible({ timeout: 150 })) {
-          const acceptBtn = page.locator(
-            '.cookie-banner button:has-text("Accept")'
-          );
+        const visible = await overlay
+          .isVisible({ timeout: 500 })
+          .catch(() => false);
 
-          let tries = 0;
+        if (!visible) return;
 
-          while (await overlay.isVisible() && tries < 4) {
-            tries++;
+        const acceptBtn = page.locator(
+          '.cookie-banner button:has-text("Accept")'
+        );
 
-            if (await acceptBtn.isVisible()) {
-              await acceptBtn
-                .click({ force: true })
-                .catch(() => { });
+        for (let i = 0; i < 3; i++) {
+          const btnVisible = await acceptBtn
+            .isVisible()
+            .catch(() => false);
 
-              await page.waitForTimeout(150);
-            }
-          }
-
-          if (await overlay.isVisible()) {
-            await page
-              .evaluate(() => {
-                document.querySelector('.cookie-overlay')?.remove();
-                document.body.style.overflow = 'auto';
+          if (btnVisible) {
+            await acceptBtn
+              .click({
+                force: true,
+                timeout: 1000
               })
               .catch(() => { });
           }
+
+          await page.waitForTimeout(100);
         }
-      } catch (e) { }
+
+        const stillVisible = await overlay
+          .isVisible()
+          .catch(() => false);
+
+        if (stillVisible) {
+          await page
+            .evaluate(() => {
+              document
+                .querySelector('.cookie-overlay')
+                ?.remove();
+
+              if (document.body) {
+                document.body.style.overflow = 'auto';
+              }
+            })
+            .catch(() => { });
+        }
+      } catch (err) {
+        // Ignore cookie overlay errors
+      }
     }
 
-    // 2. Wait for product details to render
+    // -------------------------------------------------------
+    // 2. Product information
+    // -------------------------------------------------------
+
     await page.waitForSelector('.detail-info h1', {
       timeout: 10000
     });
 
     const productName = (
-      await page.locator('.detail-info h1').innerText()
+      await page
+        .locator('.detail-info h1')
+        .innerText()
     ).trim();
 
     const brandSkuText = (
@@ -158,57 +236,64 @@ async function scrapeAttempt(productId, isHeaded = false) {
 
     await handleCookieOverlay();
 
-    // 3. Locate price block & perform human-like mouse movements
-    // to satisfy anti-bot requirements
+    // -------------------------------------------------------
+    // 3. Price block interaction
+    // -------------------------------------------------------
+
     const priceBlock = page.locator('.price-block');
 
-    await priceBlock.scrollIntoViewIfNeeded();
+    await priceBlock.scrollIntoViewIfNeeded({
+      timeout: 5000
+    }).catch(() => { });
 
-    const box = await priceBlock.boundingBox();
+    const box = await priceBlock
+      .boundingBox()
+      .catch(() => null);
 
+    // Small human-like movement
     if (box) {
-      for (let i = 0; i < 22; i++) {
+      for (let i = 0; i < 8; i++) {
         await handleCookieOverlay();
 
-        await page.mouse.move(
-          box.x + 35 + i * 4,
-          box.y + 20 + (i % 3) * 4
-        );
+        await page.mouse
+          .move(
+            box.x + 30 + i * 5,
+            box.y + 20
+          )
+          .catch(() => { });
 
-        await page.waitForTimeout(55);
+        await page.waitForTimeout(50);
       }
     }
 
-    await page.waitForTimeout(750);
+    await page.waitForTimeout(300);
 
     await handleCookieOverlay();
 
-    // 4. Click "Reveal price"
+    // -------------------------------------------------------
+    // 4. Reveal price
+    // -------------------------------------------------------
+
     const revealBtn = page.locator(
       'button:has-text("Reveal price")'
     );
 
     await revealBtn.waitFor({
       state: 'visible',
-      timeout: 6000
+      timeout: 7000
     });
 
     let clickAccepted = false;
 
-    for (let c = 1; c <= 6; c++) {
+    for (let attempt = 1; attempt <= 5; attempt++) {
       await handleCookieOverlay();
 
-      const disabled = await revealBtn.getAttribute('disabled');
+      const disabled = await revealBtn
+        .getAttribute('disabled')
+        .catch(() => null);
 
       if (disabled !== null) {
-        if (box) {
-          await page.mouse.move(
-            box.x + 45 + c * 3,
-            box.y + 22
-          );
-        }
-
-        await page.waitForTimeout(250);
+        await page.waitForTimeout(300);
         continue;
       }
 
@@ -216,72 +301,77 @@ async function scrapeAttempt(productId, isHeaded = false) {
         await revealBtn.click({
           timeout: 2000
         });
-      } catch (err) {
-        await handleCookieOverlay();
-        continue;
-      }
-
-      // Check if price area transitioned to spinner,
-      // error, or success
-      try {
-        await page.waitForSelector(
-          '.spinner, .price-success, .price-error',
-          {
-            timeout: 1800
-          }
-        );
 
         clickAccepted = true;
         break;
-      } catch (e) {
-        // Click was dropped by synthetic jitter, retry
-        await page.waitForTimeout(400);
+      } catch (err) {
+        await page.waitForTimeout(300);
       }
     }
 
     if (!clickAccepted) {
       throw new Error(
-        'Failed to activate "Reveal price" button after multiple interaction attempts'
+        'Failed to activate "Reveal price" button'
       );
     }
 
-    // 5. Wait for price resolution or transient challenge errors
-    const resolution = await Promise.race([
-      page
-        .waitForSelector('.price-success', {
-          timeout: 18000
-        })
-        .then(() => 'success'),
+    console.log(
+      `[Scraper] Reveal price clicked for product ${productId}`
+    );
 
-      page
-        .waitForSelector('.price-error', {
-          timeout: 18000
-        })
-        .then(() => 'error')
-    ]);
+    // -------------------------------------------------------
+    // 5. Wait for price result
+    // -------------------------------------------------------
+
+    let resolution = null;
+
+    try {
+      resolution = await Promise.race([
+        page
+          .waitForSelector('.price-success', {
+            timeout: 12000
+          })
+          .then(() => 'success'),
+
+        page
+          .waitForSelector('.price-error', {
+            timeout: 12000
+          })
+          .then(() => 'error')
+      ]);
+    } catch (err) {
+      throw new Error(
+        `Price resolution timed out for product ${productId}`
+      );
+    }
 
     if (resolution === 'error') {
-      // Storefront encountered transient challenge_failed
       const tryAgainBtn = page.locator(
         '.price-error button:has-text("Try again")'
       );
 
-      if (await tryAgainBtn.isVisible()) {
-        await page.waitForTimeout(500);
+      const canRetry = await tryAgainBtn
+        .isVisible()
+        .catch(() => false);
 
+      if (canRetry) {
         await tryAgainBtn
-          .click()
+          .click({
+            timeout: 2000
+          })
           .catch(() => { });
 
-        // Wait again for success
-        await page.waitForSelector('.price-success', {
-          timeout: 15000
-        });
+        await page.waitForSelector(
+          '.price-success',
+          {
+            timeout: 10000
+          }
+        );
       } else {
         const errorText = await page
           .locator('.price-error')
           .innerText()
-          .catch(() => 'unknown error');
+          .catch(() => 'Unknown storefront error');
 
         throw new Error(
           `Storefront challenge failed: ${errorText}`
@@ -289,18 +379,28 @@ async function scrapeAttempt(productId, isHeaded = false) {
       }
     }
 
-    // 6. DOM Extraction of Stock
+    console.log(
+      `[Scraper] Price successfully resolved for product ${productId}`
+    );
+
+    // -------------------------------------------------------
+    // 6. Stock
+    // -------------------------------------------------------
+
     const stockBadge = page.locator('.stock-badge');
 
     const rawStockText = (
-      await stockBadge.innerText().catch(() => '')
+      await stockBadge
+        .innerText()
+        .catch(() => '')
     ).trim();
 
     const isOutOfStock = rawStockText
       .toLowerCase()
       .includes('out of stock');
 
-    const stockNumMatch = rawStockText.match(/(\d+)/);
+    const stockNumMatch =
+      rawStockText.match(/(\d+)/);
 
     const stockCount = isOutOfStock
       ? 0
@@ -308,15 +408,19 @@ async function scrapeAttempt(productId, isHeaded = false) {
         ? parseInt(stockNumMatch[1], 10)
         : 1;
 
-    // 7. DOM Extraction of Price
-    // Strict filtering: Ignore decoy elements
+    // -------------------------------------------------------
+    // 7. Price from DOM
+    // -------------------------------------------------------
+
     const domPriceInfo = await page.evaluate(() => {
-      const priceMain = document.querySelector('.price-main');
+      const priceMain =
+        document.querySelector('.price-main');
 
       if (!priceMain) return null;
 
       for (const child of priceMain.children) {
-        const style = window.getComputedStyle(child);
+        const style =
+          window.getComputedStyle(child);
 
         if (
           style.display === 'none' ||
@@ -332,21 +436,23 @@ async function scrapeAttempt(productId, isHeaded = false) {
           continue;
         }
 
-        const fSize = parseFloat(style.fontSize);
+        const fontSize =
+          parseFloat(style.fontSize);
 
-        if (fSize >= 28) {
-          const rawText = child.innerText
+        if (fontSize >= 28) {
+          return child.innerText
             .replace(/\u200B/g, '')
             .trim();
-
-          return rawText;
         }
       }
 
       return null;
     });
 
-    // 8. Determine final validated numeric price
+    // -------------------------------------------------------
+    // 8. Final price
+    // -------------------------------------------------------
+
     let finalPrice = null;
 
     if (
@@ -356,9 +462,24 @@ async function scrapeAttempt(productId, isHeaded = false) {
     ) {
       finalPrice = decryptedQuote.p;
     } else if (domPriceInfo) {
-      const digitsOnly = domPriceInfo.replace(/[^\d.]/g, '');
+      const digitsOnly =
+        domPriceInfo.replace(/[^\d.]/g, '');
+
       finalPrice = parseFloat(digitsOnly);
     }
+
+    if (
+      !Number.isFinite(finalPrice) ||
+      finalPrice <= 0
+    ) {
+      throw new Error(
+        `Could not extract valid price for product ${productId}`
+      );
+    }
+
+    // -------------------------------------------------------
+    // 9. Build scraped data
+    // -------------------------------------------------------
 
     const scrapedData = {
       productId: parseInt(productId, 10),
@@ -366,30 +487,47 @@ async function scrapeAttempt(productId, isHeaded = false) {
       category,
       brandSku: brandSkuText,
       url: targetUrl,
+
       price: finalPrice,
+
       formattedPrice:
         domPriceInfo ||
-        (finalPrice ? `₹${finalPrice}` : null),
+        `₹${finalPrice}`,
+
       stock: stockCount,
+
       stockStatus:
         rawStockText ||
-        (stockCount > 0 ? 'In Stock' : 'Out of Stock'),
+        (stockCount > 0
+          ? 'In Stock'
+          : 'Out of Stock'),
+
       currency: decryptedQuote
         ? decryptedQuote.c
         : 'INR',
+
       mrp: decryptedQuote
         ? decryptedQuote.m
         : null,
+
       seller: decryptedQuote
         ? decryptedQuote.sl
         : null,
+
       interceptedQuote: decryptedQuote,
+
       httpStatus: lastHttpStatus,
-      scrapedAt: new Date().toISOString()
+
+      scrapedAt:
+        new Date().toISOString()
     };
 
-    // 9. Validation Gatekeeper
-    const validation = validateScrapedData(scrapedData);
+    // -------------------------------------------------------
+    // 10. Validation
+    // -------------------------------------------------------
+
+    const validation =
+      validateScrapedData(scrapedData);
 
     if (!validation.isValid) {
       throw new Error(
@@ -397,34 +535,69 @@ async function scrapeAttempt(productId, isHeaded = false) {
       );
     }
 
+    console.log(
+      `[Scraper] Valid data extracted for product ${productId}: ₹${finalPrice}, stock ${stockCount}`
+    );
+
     return scrapedData;
   } finally {
-    await context.close().catch(() => { });
-    await closeBrowser(browser, isHeaded);
+    // Always close context
+    if (context) {
+      await context
+        .close()
+        .catch(() => { });
+    }
+
+    // Close only headed/dedicated browser.
+    // Shared headless browser stays alive.
+    if (browser) {
+      await closeBrowser(
+        browser,
+        isHeaded
+      );
+    }
   }
 }
 
 /**
- * High-level scraping function with exponential backoff retry mechanism
- *
- * @param {number|string} productId
- * @param {object} options - { headed, maxRetries, initialBackoffMs }
+ * Scrape with retries.
  */
 async function scrapeProductWithRetries(
   productId,
   options = {}
 ) {
-  const numericId = parseInt(productId, 10);
-  const isHeaded = Boolean(options.headed);
+  const numericId =
+    parseInt(productId, 10);
+
+  if (
+    !Number.isInteger(numericId) ||
+    numericId <= 0
+  ) {
+    return {
+      success: false,
+      data: null,
+      attempts: 0,
+      durationMs: 0,
+      status: 'failed',
+      error: new Error(
+        `Invalid product ID: ${productId}`
+      )
+    };
+  }
+
+  const isHeaded =
+    Boolean(options.headed);
+
   const maxRetries =
     options.maxRetries !== undefined
-      ? options.maxRetries
+      ? Math.max(1, options.maxRetries)
       : 3;
 
   const initialBackoffMs =
     options.initialBackoffMs || 1000;
 
   const startTime = Date.now();
+
   let attempt = 0;
   let lastError = null;
 
@@ -437,15 +610,23 @@ async function scrapeProductWithRetries(
     );
 
     try {
-      // Hard timeout for one complete scrape attempt.
-      // Prevents Render from getting stuck indefinitely.
+      /*
+       * IMPORTANT:
+       * Keep each complete attempt below 45 sec.
+       * This prevents Render request/background jobs
+       * from hanging indefinitely.
+       */
       const data = await withTimeout(
-        scrapeAttempt(numericId, isHeaded),
-        60000,
-        `Scrape attempt timed out after 60 seconds for product ${numericId}`
+        scrapeAttempt(
+          numericId,
+          isHeaded
+        ),
+        45000,
+        `Scrape attempt timed out after 45 seconds for product ${numericId}`
       );
 
-      const durationMs = Date.now() - startTime;
+      const durationMs =
+        Date.now() - startTime;
 
       console.log(
         `[Scraper] Success for product ${numericId} ` +
@@ -457,7 +638,10 @@ async function scrapeProductWithRetries(
         data,
         attempts: attempt,
         durationMs,
-        status: attempt === 1 ? 'success' : 'retried',
+        status:
+          attempt === 1
+            ? 'success'
+            : 'retried',
         error: null
       };
     } catch (err) {
@@ -468,18 +652,21 @@ async function scrapeProductWithRetries(
       );
 
       if (attempt < maxRetries) {
-        // Exponential backoff with random jitter
-        const jitter = Math.floor(
-          Math.random() * 500
-        );
+        const jitter =
+          Math.floor(
+            Math.random() * 300
+          );
 
         const backoffMs =
-          Math.pow(2, attempt - 1) *
+          Math.pow(
+            2,
+            attempt - 1
+          ) *
           initialBackoffMs +
           jitter;
 
         console.log(
-          `[Scraper] Backing off for ${backoffMs}ms before retry...`
+          `[Scraper] Waiting ${backoffMs}ms before retry for product ${numericId}...`
         );
 
         await sleep(backoffMs);
@@ -487,10 +674,11 @@ async function scrapeProductWithRetries(
     }
   }
 
-  const durationMs = Date.now() - startTime;
+  const durationMs =
+    Date.now() - startTime;
 
   console.error(
-    `[Scraper] All ${maxRetries} attempts failed for product ${numericId}: ${lastError.message}`
+    `[Scraper] All ${maxRetries} attempts failed for product ${numericId}: ${lastError?.message}`
   );
 
   return {
@@ -499,7 +687,9 @@ async function scrapeProductWithRetries(
     attempts: attempt,
     durationMs,
     status: 'failed',
-    error: lastError
+    error:
+      lastError ||
+      new Error('Unknown scraping error')
   };
 }
 
